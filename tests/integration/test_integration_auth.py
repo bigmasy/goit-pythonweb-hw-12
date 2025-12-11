@@ -3,17 +3,18 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, UTC
-from jose import jwt
+from jose import jwt, JWTError
 
-# Імпорти для конфігурації та тестового користувача
-from tests.conftest import test_user 
-from src.conf.config import config 
+# Assuming imports from conftest are accessible
+from tests.conftest import test_user
+from src.conf.config import config
+from src.database.models import User 
 
-# === ФІКСТУРИ ===
+# === FIXTURES ===
 
 @pytest.fixture(scope="module")
 def new_user_data():
-    """Дані для нового користувача, який не існує в тестовій DB."""
+    """Data for a new, non-existent user in the test DB."""
     return {
         "username": "newuser",
         "email": "newuser@example.com",
@@ -22,7 +23,7 @@ def new_user_data():
 
 @pytest.fixture
 def mock_redis_only():
-    """Імітує лише Redis (потрібно для get_current_user), щоб змусити його звертатися до DB."""
+    """Mocks Redis to return None, forcing get_current_user to check the DB."""
     mock_redis = MagicMock()
     mock_redis.get.return_value = None
     
@@ -31,7 +32,7 @@ def mock_redis_only():
 
 @pytest.fixture
 def valid_email_token():
-    """Створює дійсний JWT для підтвердження email (для скидання пароля)."""
+    """Creates a valid JWT for email confirmation/password reset (valid for 20 minutes)."""
     expire = datetime.now(UTC) + timedelta(minutes=20)
     to_encode = {"sub": test_user["email"], "exp": expire}
     
@@ -40,12 +41,22 @@ def valid_email_token():
     )
     return token
 
-# === ТЕСТИ ===
+@pytest.fixture
+def expired_email_token():
+    """Creates an expired JWT for email confirmation/password reset."""
+    expire = datetime.now(UTC) - timedelta(minutes=1)
+    to_encode = {"sub": test_user["email"], "exp": expire}
+    
+    token = jwt.encode(
+        to_encode, config.JWT_SECRET, algorithm=config.JWT_ALGORITHM
+    )
+    return token
 
-# 1. Тести реєстрації та логіну
+# === TESTS ===
+
+# 1. Registration and Login Tests
 
 @pytest.mark.asyncio
-# *** КРИТИЧНЕ ВИПРАВЛЕННЯ: Патчимо функцію в модулі, де вона викликається (src.api.auth) ***
 @patch("src.api.auth.send_verification_email")
 async def test_register_user_success(
     mock_send_verify: MagicMock,
@@ -54,7 +65,7 @@ async def test_register_user_success(
     mock_redis_only
 ):
     """
-    Тестує успішну реєстрацію нового користувача.
+    Tests successful registration of a new user.
     """
     response = client.post(
         "/api/auth/register",
@@ -63,14 +74,14 @@ async def test_register_user_success(
     
     assert response.status_code == status.HTTP_201_CREATED
     
-    # Перевірка, що фонова задача викликана
+    # Check that the background task was called
     mock_send_verify.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_register_user_duplicate_email(client: TestClient, mock_redis_only):
     """
-    Тестує реєстрацію з уже існуючим email (очікуємо 409 Conflict).
+    Tests registration with an already existing email (expecting 409 Conflict).
     """
     duplicate_data = {
         "username": "anotheruser",
@@ -84,12 +95,33 @@ async def test_register_user_duplicate_email(client: TestClient, mock_redis_only
     )
     
     assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["detail"] == "User with this email already exists."
+
+
+@pytest.mark.asyncio
+async def test_register_user_duplicate_username(client: TestClient, mock_redis_only):
+    """
+    Tests registration with an already existing username (expecting 409 Conflict).
+    """
+    duplicate_data = {
+        "username": test_user["username"],
+        "email": "newuniqueemail@example.com",
+        "password": "somepassword",
+    }
+    
+    response = client.post(
+        "/api/auth/register",
+        json=duplicate_data,
+    )
+    
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["detail"] == "User with that name already exists."
 
 
 @pytest.mark.asyncio
 async def test_login_user_success(client: TestClient, mock_redis_only):
     """
-    Тестує успішний логін підтвердженого користувача.
+    Tests successful login of a confirmed user.
     """
     response = client.post(
         "/api/auth/login",
@@ -103,7 +135,7 @@ async def test_login_user_success(client: TestClient, mock_redis_only):
 @pytest.mark.asyncio
 async def test_login_user_incorrect_password(client: TestClient, mock_redis_only):
     """
-    Тестує логін з неправильним паролем (очікуємо 401 Unauthorized).
+    Tests login with an incorrect password (expecting 401 Unauthorized).
     """
     response = client.post(
         "/api/auth/login",
@@ -112,14 +144,40 @@ async def test_login_user_incorrect_password(client: TestClient, mock_redis_only
     )
     
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Incorrect login or password"
 
 
-# 2. Тести підтвердження email та запиту на email
+@pytest.mark.asyncio
+async def test_login_user_unconfirmed(client: TestClient, new_user_data: dict, mock_redis_only, caplog):
+    """
+    Tests login of a user whose email is not confirmed (expecting 401 Unauthorized).
+    """
+    unconfirmed_data = {
+        "username": "unconfirmed_login",
+        "email": "unconfirmed_login@example.com",
+        "password": "testpass",
+    }
+
+    # Create unconfirmed user
+    with patch("src.api.auth.send_verification_email"):
+        client.post("/api/auth/register", json=unconfirmed_data)
+
+    response = client.post(
+        "/api/auth/login",
+        data={"username": unconfirmed_data["username"], "password": unconfirmed_data["password"]},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Email address not confirmed"
+
+
+# 2. Email Confirmation and Request Tests
 
 @pytest.mark.asyncio
 async def test_confirmed_email_success(client: TestClient, valid_email_token: str, mock_redis_only):
     """
-    Тестує успішне підтвердження email (очікуємо 200).
+    Tests successful email confirmation (expecting 200).
     """
     response = client.get(f"/api/auth/confirmed_email/{valid_email_token}")
     
@@ -127,30 +185,48 @@ async def test_confirmed_email_success(client: TestClient, valid_email_token: st
 
 
 @pytest.mark.asyncio
-# *** ВИПРАВЛЕНО: Патчимо функцію в модулі, де вона викликається (src.api.auth) ***
+async def test_confirmed_email_invalid_token(client: TestClient, mock_redis_only):
+    """
+    Tests email confirmation with an invalid token format (expecting 422 Unprocessable Content).
+    """
+    response = client.get("/api/auth/confirmed_email/totally_invalid_token_format")
+    
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+@pytest.mark.asyncio
+async def test_confirmed_email_expired_token(client: TestClient, expired_email_token: str, mock_redis_only):
+    """
+    Tests email confirmation with an expired token (expecting 422 Unprocessable Content).
+    """
+    response = client.get(f"/api/auth/confirmed_email/{expired_email_token}")
+    
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+
+
+@pytest.mark.asyncio
 @patch("src.api.auth.send_verification_email")
 async def test_request_email_success(
     mock_send_verify: MagicMock,
     client: TestClient, 
-    new_user_data: dict, # Використовуємо для створення користувача
+    new_user_data: dict,
     mock_redis_only
 ):
     """
-    Тестує повторний запит на підтвердження email.
+    Tests the request for a new email confirmation link for an unconfirmed user.
     """
-    # 1. Реєструємо нового користувача для гарантії існування в DB
+    # 1. Register a new user to guarantee existence in DB
     unconfirmed_data = {
         "username": "unconfirmed_req",
         "email": "unconfirmed_req@example.com",
         "password": "testpass",
     }
-    # Мок send_verification_email активний, тому SMTP-помилки не буде
-    client.post("/api/auth/register", json=unconfirmed_data)
+    with patch("src.api.auth.send_verification_email"):
+        client.post("/api/auth/register", json=unconfirmed_data)
     
-    # Скидаємо лічильник моку, щоб рахувати тільки виклик request_email
     mock_send_verify.reset_mock() 
 
-    # 2. Виконуємо запит request_email
+    # 2. Execute the request_email
     response = client.post(
         "/api/auth/request_email",
         json={"email": unconfirmed_data["email"]},
@@ -158,12 +234,25 @@ async def test_request_email_success(
 
     assert response.status_code == status.HTTP_200_OK
     mock_send_verify.assert_called_once()
+    
+    
+@pytest.mark.asyncio
+async def test_request_email_already_confirmed(client: TestClient, mock_redis_only):
+    """
+    Tests email request for an already confirmed user (should return a success message).
+    """
+    response = client.post(
+        "/api/auth/request_email",
+        json={"email": test_user["email"]},
+    )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["message"] == "Your email has already been confirmed."
 
 
-# 3. Тести скидання пароля
+# 3. Password Reset Tests
 
 @pytest.mark.asyncio
-# *** ВИПРАВЛЕНО: Патчимо функцію в модулі, де вона викликається (src.api.auth) ***
 @patch("src.api.auth.send_password_reset_email")
 async def test_request_password_reset_success(
     mock_send_reset: MagicMock,
@@ -171,7 +260,7 @@ async def test_request_password_reset_success(
     mock_redis_only
 ):
     """
-    Тестує запит на скидання пароля (POST /auth/request_password_reset).
+    Tests the request for a password reset email (POST /auth/request_password_reset).
     """
     response = client.post(
         "/api/auth/request_password_reset",
@@ -186,7 +275,7 @@ async def test_request_password_reset_success(
 @pytest.mark.asyncio
 async def test_password_reset_success(client: TestClient, valid_email_token: str, mock_redis_only):
     """
-    Тестує успішне скидання пароля (POST /auth/password_reset/{token}).
+    Tests successful password reset (POST /auth/password_reset/{token}).
     """
     new_password = "verysecurenewpassword"
     
@@ -197,7 +286,7 @@ async def test_password_reset_success(client: TestClient, valid_email_token: str
     
     assert response.status_code == status.HTTP_200_OK
     
-    # Перевірка, чи новий пароль працює 
+    # Check that the new password works 
     login_response = client.post(
         "/api/auth/login",
         data={"username": test_user["username"], "password": new_password},
@@ -205,3 +294,16 @@ async def test_password_reset_success(client: TestClient, valid_email_token: str
     )
     
     assert login_response.status_code == status.HTTP_200_OK
+
+
+@pytest.mark.asyncio
+async def test_password_reset_invalid_token(client: TestClient, mock_redis_only):
+    """
+    Tests password reset with an invalid token (expecting 422 Unprocessable Content).
+    """
+    response = client.post(
+        "/api/auth/password_reset/invalid_token_string",
+        json={"new_password": "testpassword"},
+    )
+    
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY

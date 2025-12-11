@@ -29,28 +29,49 @@ test_user = {
     "password": "12345678",
 }
 
+non_admin_user = {
+    "username": "nonadmin",
+    "email": "user@example.com",
+    "password": "passworduser",
+}
 
 @pytest.fixture(scope="module", autouse=True)
 def init_models_wrap():
+    """Initializes the database, drops/creates tables, and inserts base test users (ADMIN and USER)."""
     async def init_models():
         async with engine.begin() as conn:
+            # Clear and create tables
             await conn.run_sync(Base.metadata.drop_all)
             await conn.run_sync(Base.metadata.create_all)
+            
         async with TestingSessionLocal() as session:
-            hash_password = get_password_hash(test_user["password"])
-            current_user = User(
+            # 1. Create ADMIN user
+            hash_password_admin = get_password_hash(test_user["password"])
+            admin_user = User(
                 username=test_user["username"],
                 email=test_user["email"],
-                hashed_password=hash_password,
+                hashed_password=hash_password_admin,
                 confirmed=True,
                 avatar="https://twitter.com/gravatar",
                 role=UserRole.ADMIN,
             )
-            session.add(current_user)
+            session.add(admin_user)
+            
+            # 2. Create NON-ADMIN user
+            hash_password_user = get_password_hash(non_admin_user["password"])
+            regular_user = User(
+                username=non_admin_user["username"],
+                email=non_admin_user["email"],
+                hashed_password=hash_password_user,
+                confirmed=True,
+                avatar="https://twitter.com/gravatar",
+                role=UserRole.USER, # Standard role
+            )
+            session.add(regular_user)
+
             await session.commit()
 
     asyncio.run(init_models())
-
 
 @pytest.fixture(scope="module")
 def client():
@@ -69,7 +90,14 @@ def client():
     yield TestClient(app)
 
 
-@pytest_asyncio.fixture()
+@pytest_asyncio.fixture(scope="module")
 async def get_token():
+    """Fixture to get the access token for the ADMIN user."""
     token = await create_access_token(data={"sub": test_user["username"]})
+    return token
+
+@pytest_asyncio.fixture(scope="module")
+async def non_admin_token():
+    """Fixture to get the access token for the regular user (USER)."""
+    token = await create_access_token(data={"sub": non_admin_user["username"]})
     return token

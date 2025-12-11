@@ -1,0 +1,71 @@
+version: "3.8"
+
+services:
+  # 1. Database Service (PostgreSQL)
+  db:
+    image: postgres:15-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: postgres_db
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d postgres_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # 2. Migration Service (Executes table creation and finishes)
+  migrator:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      # Database connection settings for the migrator
+      DB_URL: postgresql+asyncpg://user:password@db:5432/postgres_db
+    depends_on:
+      db:
+        condition: service_healthy # Wait until the DB is ready
+    command: python create_db.py
+    # This service should exit after success, not restart
+    restart: "no"
+
+  # 3. FastAPI Application Service (API)
+  api:
+    build: .
+    volumes:
+      # Optional: Mount the source code for hot-reloading during development
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      # Database connection settings (using the service name 'db')
+      DB_URL: postgresql+asyncpg://user:password@db:5432/postgres_db
+      # Redis connection settings (using the service name 'redis' and the required password)
+      REDIS_URL: redis://:redis_password@redis:6379/0
+      # All other config vars (MAIL, CLD) are loaded from .env/defaults
+    depends_on:
+      # Wait for migrations to finish and redis to start
+      migrator:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    restart: always
+
+  # 4. Cache/Queue Service (Redis)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    # Set the password required by the API service
+    command: redis-server --requirepass redis_password
+    restart: always
+
+# Define named volumes for persistent data
+volumes:
+  postgres_data:

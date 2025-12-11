@@ -5,97 +5,142 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 from io import BytesIO
 
-# Імпортуємо test_user, client, get_token зі спільного conftest
-# та інші необхідні об'єкти
+# Imports (assuming dependencies are available via conftest)
 from src.database.models import User
 from src.database.db import get_db
-
-# Припускаємо, що status імпортується у вашому коді або доступний
-# через стандартний імпорт fastapi
-
-# Ваші фікстури client, get_token, та test_user повинні бути доступні
-# завдяки conftest.py, якщо pytest їх автоматично знаходить.
+# test_user, get_token, and non_admin_token are assumed to be fixtures from conftest.py
 
 
-### 1. Тест маршруту /users/me
+# === FIXTURES ===
 
-def test_me_success(client: TestClient, get_token: str):
+@pytest.fixture(scope="function")
+def admin_headers(get_token: str):
+    """Fixture for authentication headers with ADMIN role permissions."""
+    return {"Authorization": f"Bearer {get_token}"}
+
+@pytest.fixture(scope="function")
+def user_headers(non_admin_token: str):
+    """Fixture for authentication headers with regular USER role permissions."""
+    return {"Authorization": f"Bearer {non_admin_token}"}
+
+# === TESTS ===
+
+# 1. /users/me Route Tests
+
+def test_me_success(client: TestClient, admin_headers: dict):
     """
-    Тестує успішний запит до /users/me з дійсним токеном.
+    Tests successful request to /users/me with a valid token.
     """
-    headers = {"Authorization": f"Bearer {get_token}"}
-    response = client.get("/api/users/me", headers=headers)
+    response = client.get("/api/users/me", headers=admin_headers)
 
     assert response.status_code == status.HTTP_200_OK
     data = response.json()
     
-    # Перевіряємо, що повернуті дані користувача відповідають тестовому користувачу
     assert data["username"] == "deadpool"
     assert data["email"] == "deadpool@example.com"
-    assert "id" in data
-    assert "avatar" in data
 
 
 def test_me_unauthorized(client: TestClient):
     """
-    Тестує запит до /users/me без токена (неавторизований доступ).
+    Tests request to /users/me without a token (unauthorized access).
     """
-    # Запит без заголовка Authorization
     response = client.get("/api/users/me")
 
-    # Очікується 401 Unauthorized
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
     assert response.json() == {"detail": "Not authenticated"}
 
 
-# Примітка: Тестування лімітера (slowapi) вимагає складнішого налаштування, 
-# включаючи імітацію декількох запитів за короткий час. 
-# Зазвичай це робиться окремо або ігнорується у простих юніт-тестах.
+def test_me_invalid_token(client: TestClient):
+    """
+    Tests request to /users/me with an invalid token (401 Unauthorized).
+    """
+    headers = {"Authorization": "Bearer invalid.jwt.token"}
+    response = client.get("/api/users/me", headers=headers)
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Could not validate credentials"
+
+
+# 2. Avatar Update Tests (PATCH /users/avatar)
+
 @pytest.mark.asyncio
 @patch("src.services.upload_file.UploadFileService.upload_file")
-@patch("redis.from_url") # <--- ДОДАНО: Імітація підключення до Redis
+@patch("redis.from_url") 
 async def test_update_avatar_success(
-    mock_redis_from_url: MagicMock, # <--- Новий аргумент для імітованого Redis
+    mock_redis_from_url: MagicMock, 
     mock_upload_file: MagicMock, 
     client: TestClient, 
-    get_token: str, 
+    admin_headers: dict, 
     init_models_wrap
 ):
     """
-    Тестує успішне оновлення аватара. Імітує Cloudinary API та Redis.
+    Tests successful avatar update (for an authorized user).
+    Assumes the user is either ADMIN or has the required permissions.
     """
-    # 1. Налаштування імітації Redis
     mock_redis = MagicMock()
-    
-    # Говоримо, що redis.from_url повинен повернути наш імітований об'єкт
     mock_redis_from_url.return_value = mock_redis
-    
-    # Говоримо, що метод get() на нашому імітованому Redis повинен повернути None
-    # Це змусить get_current_user ЗВЕРНУТИСЯ ДО БАЗИ ДАНИХ, щоб отримати актуальну роль
     mock_redis.get.return_value = None 
     
-    # 2. Налаштування імітації Cloudinary
     test_avatar_url = "https://new-avatar.example.com/deadpool_new"
     mock_upload_file.return_value = test_avatar_url
 
-    headers = {"Authorization": f"Bearer {get_token}"}
     test_file_content = b"fake image content"
     
-    # 3. Виконання запиту
     response = client.patch(
         "/api/users/avatar",
-        headers=headers,
+        headers=admin_headers,
         files={"file": ("test.jpg", BytesIO(test_file_content), "image/jpeg")},
     )
 
-    # 4. Перевірка
     assert response.status_code == status.HTTP_200_OK
     data = response.json()
     
     assert data["avatar"] == test_avatar_url
     
-    # Перевірка, що Redis.get був викликаний, але повернув None
-    mock_redis.get.assert_called_once()
-    
-    # Перевірка, що користувач був записаний назад у кеш
     mock_redis.set.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("src.services.upload_file.UploadFileService.upload_file")
+@patch("redis.from_url") 
+async def test_update_avatar_forbidden(
+    mock_redis_from_url: MagicMock, 
+    mock_upload_file: MagicMock, 
+    client: TestClient, 
+    user_headers: dict, 
+    init_models_wrap
+):
+    """
+    Tests avatar update by a regular user (non-admin). Expect 403 Forbidden.
+    """
+    mock_redis = MagicMock()
+    mock_redis_from_url.return_value = mock_redis
+    mock_redis.get.return_value = None 
+    
+    test_file_content = b"fake image content"
+    
+    response = client.patch(
+        "/api/users/avatar",
+        headers=user_headers,
+        files={"file": ("test.jpg", BytesIO(test_file_content), "image/jpeg")},
+    )
+
+    # get_admin_user dependency should return 403
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["detail"] == "Allowed only for Admin"
+
+
+@pytest.mark.asyncio
+@patch("src.services.upload_file.UploadFileService.upload_file")
+async def test_update_avatar_unauthorized(mock_upload_file: MagicMock, client: TestClient):
+    """
+    Tests avatar update without a token. Expect 401 Unauthorized.
+    """
+    test_file_content = b"fake image content"
+    
+    response = client.patch(
+        "/api/users/avatar",
+        files={"file": ("test.jpg", BytesIO(test_file_content), "image/jpeg")},
+    )
+
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED

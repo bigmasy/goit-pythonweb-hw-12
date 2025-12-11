@@ -3,38 +3,40 @@ from fastapi import status
 from fastapi.testclient import TestClient
 from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
-from io import BytesIO
-from src.services.contacts import ContactService
+from src.services.contacts import DuplicateContactError 
 
-# Дані для створення тестового контакту
+# Data for creating a test contact
 test_contact_data = {
     "first_name": "Wade",
     "last_name": "Wilson",
     "email": "wade.wilson@xforce.com",
     "phone_number": "555-1234-567",
-    # Виправлено: Використовуємо 'birthday'
     "birthday": str(date.today() - timedelta(days=365 * 30)),
-    "notes": "Merc with a mouth."
+    "additional_data": "Merc with a mouth."
 }
 
-# Змінна для зберігання ID контакту
+# Variable to store the contact ID (used across tests)
 CONTACT_ID = None
 
 @pytest.fixture(scope="function")
 def headers(get_token: str):
-    """Фікстура для заголовків аутентифікації"""
+    """Fixture for authentication headers."""
     return {"Authorization": f"Bearer {get_token}"}
 
+@pytest.fixture(scope="function")
+def invalid_headers():
+    """Fixture for invalid authentication headers."""
+    return {"Authorization": f"Bearer invalid_token_format"}
 
-### 1. Тести створення (POST)
+
+### 1. Create Tests (POST)
 
 @pytest.mark.asyncio
 @patch("redis.from_url") 
 async def test_create_contact_success(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на успішне створення нового контакту (POST /contacts/). Очікуємо 201.
+    Tests successful creation of a new contact (POST /api/contacts/). Expect 201.
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -51,53 +53,65 @@ async def test_create_contact_success(mock_redis_from_url: MagicMock, client: Te
     data = response.json()
     assert "id" in data
     
-    # Зберігаємо ID для використання в інших тестах
+    # Store ID for use in other tests
     CONTACT_ID = data["id"]
-    
+
+
 @pytest.mark.asyncio
 @patch("redis.from_url")
-@patch("src.services.contacts.ContactService.create_contact") # <--- ПАТЧИМО МЕТОД СЕРВІСУ
+# Patch the repository method that raises DuplicateContactError
+@patch("src.repository.contacts.ContactRepository.create_contact") 
 async def test_create_contact_duplicate(
-    mock_create_contact: MagicMock, 
+    mock_create_contact_repo: MagicMock, 
     mock_redis_from_url: MagicMock, 
     client: TestClient, 
     headers: dict
 ):
     """
-    Тест на створення контакту з однаковими даними. Очікуємо 409 Conflict.
-    (Імітуємо виняток DuplicateContactError, який має повернути сервіс/репозиторій).
+    Tests creation with duplicate email/phone data. Expect 409 Conflict.
+    (Mocks the repository exception).
     """
-    # 1. Імітація Redis (як і раніше)
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
 
-    # 2. Змушуємо імітований метод викликати очікуваний виняток
-    from src.services.contacts import DuplicateContactError
-    mock_create_contact.side_effect = DuplicateContactError(
+    # Force the mocked method to raise the expected exception
+    mock_create_contact_repo.side_effect = DuplicateContactError(
         message="Contact with this email already exists."
     )
 
-    # 3. Виконання запиту
     response = client.post(
-        "/api/contacts/", # *** УВАГА: ВИПРАВТЕ /api/contacts/ на /contacts/ тут і в інших тестах, якщо /api не є частиною базового роутера ***
+        "/api/contacts/", 
         json=test_contact_data,
         headers=headers
     )
 
-    # Очікуємо 409 Conflict, оскільки роутер перехопив DuplicateContactError
     assert response.status_code == status.HTTP_409_CONFLICT
-    assert "detail" in response.json()
     assert response.json()["detail"] == "Contact with this email already exists."
-### 2. Тести читання (GET)
+
+
+@pytest.mark.asyncio
+async def test_create_contact_unauthorized(client: TestClient):
+    """
+    Tests request to create a contact without authorization. Expect 401 Unauthorized.
+    """
+    response = client.post(
+        "/api/contacts/",
+        json=test_contact_data,
+        headers={"Authorization": "Bearer "}
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Could not validate credentials"
+
+
+### 2. Read Tests (GET)
 
 @pytest.mark.asyncio
 @patch("redis.from_url")
 async def test_read_contacts_success(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на успішне отримання списку контактів (GET /contacts/).
+    Tests successful retrieval of the contact list (GET /api/contacts/).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -117,9 +131,8 @@ async def test_read_contacts_success(mock_redis_from_url: MagicMock, client: Tes
 @patch("redis.from_url")
 async def test_read_contact_by_id_success(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на успішне отримання контакту за ID (GET /contacts/{contact_id}).
+    Tests successful retrieval of a contact by ID (GET /api/contacts/{contact_id}).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -140,9 +153,8 @@ async def test_read_contact_by_id_success(mock_redis_from_url: MagicMock, client
 @patch("redis.from_url")
 async def test_read_contact_by_id_not_found(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на отримання неіснуючого контакту за ID (очікуємо 404).
+    Tests retrieval of a non-existent contact by ID (expect 404).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -161,9 +173,8 @@ async def test_read_contact_by_id_not_found(mock_redis_from_url: MagicMock, clie
 @patch("redis.from_url")
 async def test_search_contacts_by_name(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на пошук контакту за іменем (GET /contacts/search?query=...).
+    Tests searching for a contact by name (GET /api/contacts/search?query=...).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -178,29 +189,28 @@ async def test_search_contacts_by_name(mock_redis_from_url: MagicMock, client: T
     data = response.json()
     assert isinstance(data, list)
     assert len(data) >= 1
-    assert data[0]["first_name"] == "Wade"
 
-
-@pytest.mark.skip(reason="Fails due to repository use of func.to_char, which SQLite does not support. Fix repository logic (replace to_char with strftime) to enable this test.")
+    if data:
+        assert data[0]["first_name"] == "Wade"
+    
 @pytest.mark.asyncio
-@patch("redis.from_url")
-async def test_get_upcoming_birthdays(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
+async def test_read_contact_by_id_unauthorized(client: TestClient, headers: dict):
     """
-    Тест на отримання контактів з найближчими днями народження (GET /contacts/birthdays).
-    (Цей тест пропускається, оскільки він неминуче провалюється через to_char).
+    Tests request to read a contact with an invalid token. Expect 401.
     """
-    pass # Тест пропущений
+    response = client.get(f"/api/contacts/{CONTACT_ID}", headers={"Authorization": "Bearer wrong_token"})
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Could not validate credentials"
 
 
-### 3. Тести оновлення та видалення (PUT/DELETE)
+### 3. Update and Delete Tests (PUT/DELETE)
 
 @pytest.mark.asyncio
 @patch("redis.from_url")
 async def test_update_contact_success(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на успішне оновлення контакту (PUT /contacts/{contact_id}).
+    Tests successful contact update (PUT /api/contacts/{contact_id}).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -230,11 +240,81 @@ async def test_update_contact_success(mock_redis_from_url: MagicMock, client: Te
 
 @pytest.mark.asyncio
 @patch("redis.from_url")
+@patch("src.repository.contacts.ContactRepository.update_contact") 
+async def test_update_contact_duplicate_conflict(
+    mock_update_contact_repo: MagicMock,
+    mock_redis_from_url: MagicMock, 
+    client: TestClient, 
+    headers: dict
+):
+    """
+    Tests contact update resulting in duplicate email/phone. Expect 409 Conflict.
+    (Mocks the repository method to raise DuplicateContactError).
+    """
+    mock_redis = MagicMock()
+    mock_redis_from_url.return_value = mock_redis
+    mock_redis.get.return_value = None
+
+    # Force the mocked method to raise the expected exception
+    mock_update_contact_repo.side_effect = DuplicateContactError(
+        message="Contact with this phone number already exists."
+    )
+
+    update_data = {"phone_number": "555-999-999"}
+
+    response = client.put(
+        f"/api/contacts/{CONTACT_ID}",
+        json=update_data,
+        headers=headers
+    )
+
+    assert response.status_code == status.HTTP_409_CONFLICT
+    assert response.json()["detail"] == "Contact with this phone number already exists."
+
+
+@pytest.mark.asyncio
+@patch("redis.from_url")
+async def test_update_contact_not_found(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
+    """
+    Tests updating a non-existent contact. Expect 404.
+    """
+    mock_redis = MagicMock()
+    mock_redis_from_url.return_value = mock_redis
+    mock_redis.get.return_value = None
+    
+    non_existent_id = 99999
+    update_data = {"first_name": "NonExist"}
+    
+    response = client.put(
+        f"/api/contacts/{non_existent_id}",
+        json=update_data,
+        headers=headers
+    )
+    
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["detail"] == "Contact not found"
+
+
+@pytest.mark.asyncio
+async def test_update_contact_unauthorized(client: TestClient, headers: dict):
+    """
+    Tests request to update a contact with an invalid token. Expect 401.
+    """
+    response = client.put(
+        f"/api/contacts/{CONTACT_ID}",
+        json={"first_name": "Unauthorized"},
+        headers={"Authorization": "Bearer wrong_token"}
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Could not validate credentials"
+
+
+@pytest.mark.asyncio
+@patch("redis.from_url")
 async def test_delete_contact_success(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на успішне видалення контакту (DELETE /contacts/{contact_id}).
+    Tests successful contact deletion (DELETE /api/contacts/{contact_id}).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -250,8 +330,8 @@ async def test_delete_contact_success(mock_redis_from_url: MagicMock, client: Te
     data = response.json()
     assert data["id"] == CONTACT_ID
     
-    # Перевіряємо, чи контакт дійсно видалено
-    response_get = client.get(f"/contacts/{CONTACT_ID}", headers=headers)
+    # Check if contact is truly deleted
+    response_get = client.get(f"/api/contacts/{CONTACT_ID}", headers=headers)
     assert response_get.status_code == status.HTTP_404_NOT_FOUND
 
 
@@ -259,9 +339,8 @@ async def test_delete_contact_success(mock_redis_from_url: MagicMock, client: Te
 @patch("redis.from_url")
 async def test_delete_contact_not_found(mock_redis_from_url: MagicMock, client: TestClient, headers: dict):
     """
-    Тест на видалення неіснуючого контакту (очікуємо 404).
+    Tests deletion of a non-existent contact (expect 404).
     """
-    # Імітація Redis
     mock_redis = MagicMock()
     mock_redis_from_url.return_value = mock_redis
     mock_redis.get.return_value = None
@@ -273,3 +352,17 @@ async def test_delete_contact_not_found(mock_redis_from_url: MagicMock, client: 
     )
     
     assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_delete_contact_unauthorized(client: TestClient, headers: dict):
+    """
+    Tests request to delete a contact with an invalid token. Expect 401.
+    """
+    # Use an invalid token
+    response = client.delete(
+        f"/api/contacts/{CONTACT_ID}", 
+        headers={"Authorization": "Bearer wrong_token"}
+    )
+    assert response.status_code == status.HTTP_401_UNAUTHORIZED
+    assert response.json()["detail"] == "Could not validate credentials"
